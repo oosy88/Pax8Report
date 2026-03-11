@@ -58,6 +58,51 @@ The script produces an Excel file (`pax8_microsoft_license_report_YYYY-MM-DD.xls
 5. Fetches the full change history for each Microsoft subscription.
 6. Exports everything to a formatted Excel workbook with filters, sorted alphabetically by company name.
 
+---
+
+## Script 2: License Optimization Analyzer
+
+Analyzes the report generated above and recommends how many licenses to convert from monthly to annual commitment to reduce costs.
+
+### Pricing Setup (Optional)
+
+To enable dollar savings calculations, create a `pricing.csv` file:
+
+```bash
+cp pricing.csv.example pricing.csv
+```
+
+Edit `pricing.csv` with your actual per-license monthly and annual prices from PAX8. If you skip this step, the analyzer still runs — it just won't calculate dollar amounts.
+
+### Run the Analyzer
+
+```bash
+# Pass the report file explicitly
+python3 license_optimizer.py pax8_microsoft_license_report_2026-03-11.xlsx
+
+# Or let it auto-detect the most recent report
+python3 license_optimizer.py
+```
+
+### Output
+
+Generates `license_optimization_YYYY-MM-DD.xlsx` with four tabs:
+
+- **Recommendations** — Per client/product annual vs monthly split at three risk tiers (conservative, moderate, aggressive) with savings and risk exposure.
+- **Client Trends** — Month-by-month license count grid for visual trend inspection.
+- **Savings Summary** — Per-client and portfolio-wide savings potential at each tier.
+- **Unmatched Products** — Products missing from `pricing.csv` so you know what to add.
+
+### How Tiers Work
+
+| Tier | Logic | Risk Level |
+|---|---|---|
+| Conservative | 12-month min minus 10% buffer | Lowest |
+| Moderate | 12-month min (stable/growing trends only) | Medium |
+| Aggressive | 6-month min (growing + low volatility + no recent decreases) | Higher |
+
+---
+
 ## Troubleshooting
 
 - **Authentication fails** — Double-check your `PAX8_CLIENT_ID` and `PAX8_CLIENT_SECRET` in `.env`. Ensure your account has Partner Admin access.
