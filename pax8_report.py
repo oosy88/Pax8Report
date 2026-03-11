@@ -261,7 +261,7 @@ def generate_report(summary_rows, history_rows):
     ws_summary = wb.active
     ws_summary.title = "Summary"
     summary_headers = [
-        "Company Name", "Subscription ID", "Product Name", "SKU",
+        "Company Name", "Subscription ID", "Product ID", "Product Name", "SKU",
         "Status", "Current Quantity", "Start Date", "Billing Term",
         "Commitment Term", "Price Per Unit",
     ]
@@ -347,6 +347,7 @@ def main():
 
         for sub_idx, (sub, product) in enumerate(ms_subs, 1):
             sub_id = sub.get("id", "")
+            product_id = sub.get("productId", "")
             product_name = product.get("name", "")
             sku = product.get("sku", "") or product.get("vendorSku", "")
             status = sub.get("status", "")
@@ -358,7 +359,7 @@ def main():
             price = sub.get("price", "")
 
             summary_rows.append([
-                company_name, sub_id, product_name, sku,
+                company_name, sub_id, product_id, product_name, sku,
                 status, quantity, start_date, billing_term,
                 commitment_str, price,
             ])

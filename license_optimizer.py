@@ -3,18 +3,22 @@
 PAX8 Microsoft License Optimization Analyzer
 Analyzes Microsoft license trends from the PAX8 report and recommends
 annual vs monthly commitment splits to reduce costs.
+
+Fetches live pricing from the PAX8 API for each product found in the report.
 """
 
-import csv
 import glob
 import math
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 
+import requests
+from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 
@@ -22,14 +26,179 @@ from openpyxl.utils import get_column_letter
 # Constants
 # ---------------------------------------------------------------------------
 
+API_BASE = "https://api.pax8.com/v1"
+TOKEN_URL = "https://token-manager.pax8.com/oauth/token"
+MAX_RETRIES = 5
+INITIAL_BACKOFF = 1
+
 SUMMARY_REQUIRED_COLS = [
-    "Company Name", "Subscription ID", "Product Name", "SKU",
+    "Company Name", "Subscription ID", "Product ID", "Product Name", "SKU",
     "Status", "Current Quantity", "Start Date", "Billing Term",
 ]
 HISTORY_REQUIRED_COLS = [
     "Company Name", "Subscription ID", "Product Name", "Date",
     "Action/Change Type", "Quantity Change", "Total Quantity After Change",
 ]
+
+
+# ---------------------------------------------------------------------------
+# PAX8 API — Authentication & Pricing
+# ---------------------------------------------------------------------------
+
+def load_credentials():
+    """Load PAX8 credentials from .env."""
+    load_dotenv()
+    client_id = os.getenv("PAX8_CLIENT_ID", "").strip()
+    client_secret = os.getenv("PAX8_CLIENT_SECRET", "").strip()
+
+    if not client_id or not client_secret or client_id == "your_client_id_here":
+        print("\nWARNING: PAX8 credentials not configured in .env")
+        print("  Dollar savings calculations will be skipped.")
+        print("  To enable pricing, add PAX8_CLIENT_ID and PAX8_CLIENT_SECRET to .env")
+        return None, None
+
+    return client_id, client_secret
+
+
+def authenticate(client_id, client_secret):
+    """Authenticate with PAX8 and return a configured requests session."""
+    print("Authenticating with PAX8 API...", end=" ", flush=True)
+
+    try:
+        resp = requests.post(TOKEN_URL, json={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "audience": "https://api.pax8.com",
+            "grant_type": "client_credentials",
+        })
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError:
+        print("FAILED.")
+        print(f"  Authentication failed (HTTP {resp.status_code}). Check .env credentials.")
+        return None
+    except requests.exceptions.ConnectionError:
+        print("FAILED.")
+        print("  Could not connect to PAX8. Check your internet connection.")
+        return None
+
+    token = resp.json().get("access_token")
+    if not token:
+        print("FAILED.")
+        print("  No access token in response.")
+        return None
+
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    })
+    print("Success.")
+    return session
+
+
+def api_request(session, method, url, retries=MAX_RETRIES, **kwargs):
+    """Make an API request with retry logic and exponential backoff."""
+    backoff = INITIAL_BACKOFF
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            resp = session.request(method, url, **kwargs)
+
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", backoff))
+                print(f"    Rate limited. Retrying in {retry_after}s...")
+                time.sleep(retry_after)
+                backoff *= 2
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            if resp.status_code >= 500:
+                print(f"    Server error ({resp.status_code}). Retry {attempt + 1}/{retries} in {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            raise
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            print(f"    Connection error. Retry {attempt + 1}/{retries} in {backoff}s...")
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+    raise last_error
+
+
+def fetch_product_pricing(session, product_id):
+    """
+    Fetch pricing for a product from the PAX8 API.
+    Returns dict with monthly_price and annual_price, or None if unavailable.
+    """
+    try:
+        data = api_request(session, "GET", f"{API_BASE}/products/{product_id}/pricing")
+    except Exception:
+        return None
+
+    content = data.get("content", []) if isinstance(data, dict) else data
+    if not content:
+        return None
+
+    monthly_rate = None
+    annual_rate = None
+
+    for entry in content:
+        billing_term = (entry.get("billingTerm") or "").strip()
+        rates = entry.get("rates", [])
+        if not rates:
+            continue
+
+        # Use the first rate's partnerBuyRate (our cost)
+        rate = rates[0].get("partnerBuyRate")
+        if rate is None:
+            continue
+
+        if billing_term == "Monthly":
+            monthly_rate = float(rate)
+        elif billing_term == "Annual":
+            annual_rate = float(rate)
+
+    if monthly_rate is not None and annual_rate is not None:
+        return {"monthly_price": monthly_rate, "annual_price": annual_rate}
+
+    # If only one term exists, we can't calculate savings between the two
+    return None
+
+
+def fetch_all_pricing(session, product_ids):
+    """
+    Fetch pricing for all unique product IDs.
+    Returns dict: product_id -> {monthly_price, annual_price}
+    """
+    pricing = {}
+    total = len(product_ids)
+    fetched = 0
+    failed = []
+
+    for i, pid in enumerate(product_ids, 1):
+        print(f"  Fetching pricing {i}/{total}: {pid[:12]}...", end=" ", flush=True)
+        result = fetch_product_pricing(session, pid)
+        if result:
+            pricing[pid] = result
+            fetched += 1
+            print(f"${result['monthly_price']:.2f}/mo, ${result['annual_price']:.2f}/yr")
+        else:
+            failed.append(pid)
+            print("no monthly+annual pricing available")
+
+    print(f"  Pricing retrieved for {fetched}/{total} products")
+    if failed:
+        print(f"  {len(failed)} products missing monthly+annual pricing comparison")
+
+    return pricing
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +214,6 @@ def find_input_file(args):
             sys.exit(1)
         return path
 
-    # Auto-detect most recent report
     pattern = "pax8_microsoft_license_report_*.xlsx"
     matches = sorted(glob.glob(pattern), reverse=True)
     if not matches:
@@ -86,57 +254,6 @@ def read_sheet(wb, sheet_name, required_cols):
     return records
 
 
-def load_pricing(script_dir):
-    """Load pricing.csv if it exists. Returns dict keyed by (product_name, sku)."""
-    pricing_path = os.path.join(script_dir, "pricing.csv")
-    if not os.path.isfile(pricing_path):
-        return None
-
-    pricing = {}
-    try:
-        with open(pricing_path, newline="", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                name = (row.get("Product Name") or "").strip()
-                sku = (row.get("SKU") or "").strip()
-                try:
-                    monthly = float(row.get("Monthly Commitment Price", 0))
-                    annual = float(row.get("Annual Commitment Price", 0))
-                except (ValueError, TypeError):
-                    continue
-                if name:
-                    pricing[(name.lower(), sku.lower())] = {
-                        "monthly_price": monthly,
-                        "annual_price": annual,
-                    }
-    except Exception as e:
-        print(f"WARNING: Could not read pricing.csv: {e}")
-        return None
-
-    return pricing
-
-
-def lookup_pricing(pricing, product_name, sku):
-    """Look up pricing by product name and SKU with fallback matching."""
-    if pricing is None:
-        return None
-    pname = (product_name or "").strip().lower()
-    psku = (sku or "").strip().lower()
-
-    # Exact match on both
-    if (pname, psku) in pricing:
-        return pricing[(pname, psku)]
-    # Match by name only
-    for (n, s), v in pricing.items():
-        if n == pname:
-            return v
-    # Match by SKU only
-    for (n, s), v in pricing.items():
-        if s and s == psku:
-            return v
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Timeline Reconstruction
 # ---------------------------------------------------------------------------
@@ -168,9 +285,8 @@ def months_between(start_ym, end_ym):
 def build_timelines(summary_records, history_records):
     """
     Build month-by-month license count timelines.
-    Returns dict: (company, product) -> {sku, timeline: {YYYY-MM: count}, current_count, status}
+    Returns dict: (company, product) -> {sku, product_id, timeline, current_count, status}
     """
-    # Group summary info
     combo_info = {}
     for rec in summary_records:
         company = str(rec.get("Company Name") or "").strip()
@@ -179,31 +295,24 @@ def build_timelines(summary_records, history_records):
             continue
         key = (company, product)
         sku = str(rec.get("SKU") or "").strip()
+        product_id = str(rec.get("Product ID") or "").strip()
         qty = _to_int(rec.get("Current Quantity", 0))
         status = str(rec.get("Status") or "").strip()
 
         if key not in combo_info:
-            combo_info[key] = {"sku": sku, "current_count": 0, "status": status}
+            combo_info[key] = {
+                "sku": sku,
+                "product_id": product_id,
+                "current_count": 0,
+                "status": status,
+            }
 
-        # Sum quantities across subscriptions for same company+product
         combo_info[key]["current_count"] += qty
+        # Keep the product_id if we have one
+        if product_id and not combo_info[key]["product_id"]:
+            combo_info[key]["product_id"] = product_id
 
-    # Group history events by (company, product), aggregate by month
-    # Each event: date, quantity after change
-    history_by_combo = defaultdict(list)
-    for rec in history_records:
-        company = str(rec.get("Company Name") or "").strip()
-        product = str(rec.get("Product Name") or "").strip()
-        date_str = str(rec.get("Date") or "").strip()
-        qty_after = _to_int(rec.get("Total Quantity After Change", 0))
-        if not company or not product or not date_str:
-            continue
-        mk = month_key(date_str)
-        if mk:
-            history_by_combo[(company, product)].append((mk, qty_after))
-
-    # For combos with history, also aggregate across multiple subscriptions
-    # We need per-subscription tracking to handle multiple subs for same product
+    # Per-subscription history tracking
     sub_history = defaultdict(list)
     for rec in history_records:
         company = str(rec.get("Company Name") or "").strip()
@@ -217,22 +326,18 @@ def build_timelines(summary_records, history_records):
         if mk:
             sub_history[(company, product, sub_id)].append((mk, qty_after))
 
-    # Build timelines
     today_ym = datetime.now().strftime("%Y-%m")
 
     for key, info in combo_info.items():
         company, product = key
 
-        # Collect all subscription histories for this combo
         related_subs = {k: v for k, v in sub_history.items()
                         if k[0] == company and k[1] == product}
 
         if not related_subs:
-            # No history — just a single point at current month
             info["timeline"] = {today_ym: info["current_count"]}
             continue
 
-        # Find date range across all subs
         all_months = set()
         for events in related_subs.values():
             for mk, _ in events:
@@ -245,15 +350,12 @@ def build_timelines(summary_records, history_records):
         max_month = max(max(all_months), today_ym)
         month_range = months_between(min_month, max_month)
 
-        # For each subscription, build its own timeline with carry-forward
         sub_timelines = {}
         for sub_key, events in related_subs.items():
             sub_id = sub_key[2]
-            # Sort events by month, take last event per month
             monthly = {}
             for mk, qty in sorted(events):
                 monthly[mk] = qty
-            # Fill in timeline with carry-forward
             tl = {}
             last_val = 0
             for m in month_range:
@@ -262,7 +364,6 @@ def build_timelines(summary_records, history_records):
                 tl[m] = last_val
             sub_timelines[sub_id] = tl
 
-        # Aggregate: sum across subscriptions per month
         timeline = {}
         for m in month_range:
             total = sum(tl.get(m, 0) for tl in sub_timelines.values())
@@ -274,7 +375,6 @@ def build_timelines(summary_records, history_records):
 
 
 def _to_int(val):
-    """Safely convert value to int."""
     if val is None:
         return 0
     try:
@@ -299,7 +399,6 @@ def calculate_metrics(timeline, current_count):
     if n == 0:
         return empty_metrics(current_count)
 
-    # Trailing windows
     trail_12 = values[-12:] if n >= 12 else values
     trail_6 = values[-6:] if n >= 6 else values
 
@@ -307,7 +406,6 @@ def calculate_metrics(timeline, current_count):
     min_6 = min(trail_6)
     max_12 = max(trail_12)
 
-    # Volatility (std dev)
     if len(trail_12) > 1:
         mean = sum(trail_12) / len(trail_12)
         variance = sum((x - mean) ** 2 for x in trail_12) / (len(trail_12) - 1)
@@ -315,10 +413,8 @@ def calculate_metrics(timeline, current_count):
     else:
         std_dev = 0.0
 
-    # Linear regression slope on trailing 12
     slope = _linear_slope(trail_12)
 
-    # Trend direction
     if current_count > 0:
         slope_pct = slope / current_count
     else:
@@ -330,16 +426,14 @@ def calculate_metrics(timeline, current_count):
     else:
         trend = "Stable"
 
-    # Months since last decrease
     months_since_decrease = None
     for i in range(len(values) - 1, 0, -1):
         if values[i] < values[i - 1]:
             months_since_decrease = len(values) - 1 - i
             break
     if months_since_decrease is None:
-        months_since_decrease = len(values)  # never decreased
+        months_since_decrease = len(values)
 
-    # Largest single drop
     largest_drop = 0
     for i in range(1, len(values)):
         drop = values[i - 1] - values[i]
@@ -376,7 +470,6 @@ def empty_metrics(current_count):
 
 
 def _linear_slope(values):
-    """Simple linear regression slope."""
     n = len(values)
     if n < 2:
         return 0.0
@@ -394,7 +487,6 @@ def _linear_slope(values):
 # ---------------------------------------------------------------------------
 
 def generate_recommendations(metrics):
-    """Generate conservative/moderate/aggressive annual commitment recommendations."""
     cc = metrics["current_count"]
     min12 = metrics["min_12"]
     min6 = metrics["min_6"]
@@ -405,7 +497,6 @@ def generate_recommendations(metrics):
 
     notes = []
 
-    # Single license — no point optimizing
     if cc <= 1:
         notes.append("Single license — keep monthly")
         return {
@@ -413,27 +504,22 @@ def generate_recommendations(metrics):
             "notes": "; ".join(notes),
         }
 
-    # Low confidence flag
     if months_data < 3:
         notes.append("Low confidence — limited history")
 
-    # Conservative: 12-month min minus 10% buffer
     conservative = max(0, math.floor(min12 * 0.9))
 
-    # Moderate: 12-month min if trend is stable/growing, else conservative
     if trend in ("Stable", "Growing"):
         moderate = min12
     else:
         moderate = conservative
 
-    # Aggressive: 6-month min if all conditions met, else moderate
     low_volatility = (std_dev < 0.1 * cc) if cc > 0 else True
     if trend == "Growing" and months_since_dec >= 6 and low_volatility:
         aggressive = min6
     else:
         aggressive = moderate
 
-    # Ensure none exceed current count
     conservative = min(conservative, cc)
     moderate = min(moderate, cc)
     aggressive = min(aggressive, cc)
@@ -447,7 +533,6 @@ def generate_recommendations(metrics):
 
 
 def calculate_savings(rec, metrics, price_info):
-    """Calculate savings and risk for each tier."""
     cc = metrics["current_count"]
     min12 = metrics["min_12"]
 
@@ -469,9 +554,8 @@ def calculate_savings(rec, metrics, price_info):
         total_cost = annual_cost + monthly_cost
         net_savings = current_annual_cost - total_cost
 
-        # Risk: overpay if count drops to 12-month min
         overpay_qty = max(0, annual_qty - min12)
-        risk = overpay_qty * ap * 6  # 6 months avg remaining
+        risk = overpay_qty * ap * 6
 
         result[tier] = {
             "savings": round(net_savings, 2),
@@ -523,12 +607,10 @@ def alt_rows(ws, num_cols):
 
 
 def freeze_panes(ws, row=2, col=3):
-    """Freeze header row and first two columns."""
     ws.freeze_panes = ws.cell(row=row, column=col)
 
 
 def fmt_currency(ws, col_indices):
-    """Apply currency format to specific columns (1-based)."""
     for r in range(2, ws.max_row + 1):
         for c in col_indices:
             cell = ws.cell(row=r, column=c)
@@ -537,7 +619,6 @@ def fmt_currency(ws, col_indices):
 
 
 def write_recommendations_tab(wb, results, has_pricing):
-    """Tab 1: Recommendations."""
     ws = wb.active
     ws.title = "Recommendations"
 
@@ -563,9 +644,7 @@ def write_recommendations_tab(wb, results, has_pricing):
 
     ws.append(headers)
 
-    # Sort results
     sorted_keys = sorted(results.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
-
     trend_col = headers.index("Trend Direction") + 1
 
     for key in sorted_keys:
@@ -600,7 +679,6 @@ def write_recommendations_tab(wb, results, has_pricing):
     style_header(ws, num_cols)
     alt_rows(ws, num_cols)
 
-    # Trend direction conditional formatting
     for r in range(2, ws.max_row + 1):
         cell = ws.cell(row=r, column=trend_col)
         if cell.value == "Growing":
@@ -619,10 +697,8 @@ def write_recommendations_tab(wb, results, has_pricing):
 
 
 def write_trends_tab(wb, results, combo_info):
-    """Tab 2: Client Trends — month-by-month grid."""
     ws = wb.create_sheet("Client Trends")
 
-    # Collect all months across all combos
     all_months = set()
     for info in combo_info.values():
         all_months.update(info.get("timeline", {}).keys())
@@ -651,7 +727,6 @@ def write_trends_tab(wb, results, combo_info):
 
 
 def write_savings_summary_tab(wb, results, has_pricing):
-    """Tab 3: Savings Summary rolled up by company."""
     ws = wb.create_sheet("Savings Summary")
 
     headers = [
@@ -662,7 +737,6 @@ def write_savings_summary_tab(wb, results, has_pricing):
     ]
     ws.append(headers)
 
-    # Aggregate by company
     company_data = defaultdict(lambda: {
         "current_cost": 0, "con_sav": 0, "mod_sav": 0, "agg_sav": 0,
         "num_products": 0, "trends": [],
@@ -681,12 +755,10 @@ def write_savings_summary_tab(wb, results, has_pricing):
             d["agg_sav"] += sav["aggressive"]["savings"] or 0
 
     sorted_companies = sorted(company_data.keys(), key=str.lower)
-
     totals = {"current_cost": 0, "con_sav": 0, "mod_sav": 0, "agg_sav": 0, "num_products": 0}
 
     for company in sorted_companies:
         d = company_data[company]
-        # Overall trend
         trend_counts = defaultdict(int)
         for t in d["trends"]:
             trend_counts[t] += 1
@@ -713,7 +785,6 @@ def write_savings_summary_tab(wb, results, has_pricing):
         totals["agg_sav"] += d["agg_sav"]
         totals["num_products"] += d["num_products"]
 
-    # Totals row
     totals_row = [
         "TOTAL",
         totals["current_cost"] if has_pricing else "N/A",
@@ -725,7 +796,6 @@ def write_savings_summary_tab(wb, results, has_pricing):
     ]
     ws.append(totals_row)
 
-    # Style totals row
     totals_row_idx = ws.max_row
     for c in range(1, len(headers) + 1):
         cell = ws.cell(row=totals_row_idx, column=c)
@@ -741,15 +811,16 @@ def write_savings_summary_tab(wb, results, has_pricing):
     ws.auto_filter.ref = ws.dimensions
 
 
-def write_unmatched_tab(wb, unmatched):
-    """Tab 4: Unmatched Products."""
-    ws = wb.create_sheet("Unmatched Products")
-    headers = ["Product Name", "SKU", "Number of Clients Using It", "Total Licenses Across All Clients"]
+def write_unpriced_tab(wb, unpriced):
+    """Tab 4: Products where PAX8 API didn't return both monthly+annual pricing."""
+    ws = wb.create_sheet("Unpriced Products")
+    headers = ["Product Name", "SKU", "Product ID", "Number of Clients Using It",
+               "Total Licenses Across All Clients", "Reason"]
     ws.append(headers)
 
-    sorted_products = sorted(unmatched.items(), key=lambda x: x[1]["total_licenses"], reverse=True)
-    for (name, sku), info in sorted_products:
-        ws.append([name, sku, info["client_count"], info["total_licenses"]])
+    sorted_products = sorted(unpriced.items(), key=lambda x: x[1]["total_licenses"], reverse=True)
+    for (name, sku, pid), info in sorted_products:
+        ws.append([name, sku, pid, info["client_count"], info["total_licenses"], info["reason"]])
 
     num_cols = len(headers)
     style_header(ws, num_cols)
@@ -788,51 +859,70 @@ def _run():
     history_records = read_sheet(wb, "Subscription History", HISTORY_REQUIRED_COLS)
     wb.close()
 
-    # Count unique combos
+    # Count unique combos and collect product IDs
     combos = set()
+    product_id_map = {}  # product_id -> (product_name, sku)
     for rec in summary_records:
         company = str(rec.get("Company Name") or "").strip()
         product = str(rec.get("Product Name") or "").strip()
+        product_id = str(rec.get("Product ID") or "").strip()
+        sku = str(rec.get("SKU") or "").strip()
         if company and product:
             combos.add((company, product))
+        if product_id and product_id not in product_id_map:
+            product_id_map[product_id] = (product, sku)
 
     companies = set(c for c, _ in combos)
     print(f"Found {len(companies)} clients with {len(combos)} Microsoft product subscriptions")
+    print(f"Found {len(product_id_map)} unique products to price")
 
-    # Load pricing
-    pricing = load_pricing(script_dir)
-    has_pricing = pricing is not None and len(pricing) > 0
-    if has_pricing:
-        print(f"Loaded pricing for {len(pricing)} products from pricing.csv")
+    # Authenticate with PAX8 and fetch live pricing
+    client_id, client_secret = load_credentials()
+    api_pricing = {}
+    has_pricing = False
+
+    if client_id and client_secret:
+        session = authenticate(client_id, client_secret)
+        if session:
+            print(f"\nFetching live pricing from PAX8 API for {len(product_id_map)} products...")
+            api_pricing = fetch_all_pricing(session, list(product_id_map.keys()))
+            has_pricing = len(api_pricing) > 0
+            if has_pricing:
+                print(f"\nPricing available for {len(api_pricing)}/{len(product_id_map)} products")
+            else:
+                print("\nNo products had both monthly and annual pricing available")
     else:
-        print("No pricing.csv found — skipping dollar calculations")
+        print("\nSkipping pricing — no PAX8 credentials configured")
 
     # Build timelines
-    print("Building monthly timelines...")
+    print("\nBuilding monthly timelines...")
     combo_info = build_timelines(summary_records, history_records)
 
     # Calculate metrics and recommendations
     print("Calculating recommendations...")
     results = {}
-    unmatched = {}
+    unpriced = {}
 
     for key, info in combo_info.items():
         company, product = key
         timeline = info.get("timeline", {})
         current_count = info.get("current_count", 0)
         sku = info.get("sku", "")
+        product_id = info.get("product_id", "")
 
         metrics = calculate_metrics(timeline, current_count)
         rec = generate_recommendations(metrics)
 
-        price_info = lookup_pricing(pricing, product, sku)
+        # Look up pricing by product_id from API results
+        price_info = api_pricing.get(product_id)
+
         if has_pricing and price_info is None:
-            # Track unmatched
-            ukey = (product, sku)
-            if ukey not in unmatched:
-                unmatched[ukey] = {"client_count": 0, "total_licenses": 0}
-            unmatched[ukey]["client_count"] += 1
-            unmatched[ukey]["total_licenses"] += current_count
+            ukey = (product, sku, product_id)
+            if ukey not in unpriced:
+                reason = "No product ID" if not product_id else "No monthly+annual pricing from API"
+                unpriced[ukey] = {"client_count": 0, "total_licenses": 0, "reason": reason}
+            unpriced[ukey]["client_count"] += 1
+            unpriced[ukey]["total_licenses"] += current_count
 
         savings = calculate_savings(rec, metrics, price_info)
 
@@ -843,17 +933,17 @@ def _run():
             "savings": savings,
         }
 
-    if unmatched:
-        print(f"Unmatched products (no pricing): {len(unmatched)} — see 'Unmatched Products' tab")
+    if unpriced:
+        print(f"Unpriced products: {len(unpriced)} — see 'Unpriced Products' tab")
 
     # Generate Excel
-    print("Generating Excel report...", end=" ", flush=True)
+    print("\nGenerating Excel report...", end=" ", flush=True)
     out_wb = Workbook()
     write_recommendations_tab(out_wb, results, has_pricing)
     write_trends_tab(out_wb, results, combo_info)
     write_savings_summary_tab(out_wb, results, has_pricing)
-    if has_pricing:
-        write_unmatched_tab(out_wb, unmatched)
+    if unpriced:
+        write_unpriced_tab(out_wb, unpriced)
 
     today = datetime.now().strftime("%Y-%m-%d")
     filename = f"license_optimization_{today}.xlsx"
@@ -864,7 +954,6 @@ def _run():
     abs_path = os.path.abspath(filepath)
     print(f"\nReport saved to: {abs_path}")
 
-    # Final summary
     if has_pricing:
         total_con = sum(r["savings"]["conservative"]["savings"] or 0 for r in results.values())
         total_mod = sum(r["savings"]["moderate"]["savings"] or 0 for r in results.values())

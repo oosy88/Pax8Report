@@ -64,15 +64,11 @@ The script produces an Excel file (`pax8_microsoft_license_report_YYYY-MM-DD.xls
 
 Analyzes the report generated above and recommends how many licenses to convert from monthly to annual commitment to reduce costs.
 
-### Pricing Setup (Optional)
+### Pricing
 
-To enable dollar savings calculations, create a `pricing.csv` file:
+The optimizer automatically connects to the PAX8 API to fetch live pricing for every product found in the report. It compares Monthly vs Annual commitment rates using your partner buy rates, so dollar calculations always reflect current pricing.
 
-```bash
-cp pricing.csv.example pricing.csv
-```
-
-Edit `pricing.csv` with your actual per-license monthly and annual prices from PAX8. If you skip this step, the analyzer still runs — it just won't calculate dollar amounts.
+This uses the same `.env` credentials as the report generator — no additional setup needed. If credentials are missing, the analyzer still runs but skips dollar calculations.
 
 ### Run the Analyzer
 
@@ -91,7 +87,7 @@ Generates `license_optimization_YYYY-MM-DD.xlsx` with four tabs:
 - **Recommendations** — Per client/product annual vs monthly split at three risk tiers (conservative, moderate, aggressive) with savings and risk exposure.
 - **Client Trends** — Month-by-month license count grid for visual trend inspection.
 - **Savings Summary** — Per-client and portfolio-wide savings potential at each tier.
-- **Unmatched Products** — Products missing from `pricing.csv` so you know what to add.
+- **Unpriced Products** — Products where PAX8 didn't return both monthly and annual pricing (e.g., products only available on one billing term).
 
 ### How Tiers Work
 
