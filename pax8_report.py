@@ -354,8 +354,13 @@ def main():
             quantity = sub.get("quantity", 0)
             start_date = format_date(sub.get("startDate"))
             billing_term = sub.get("billingTerm", "")
-            commitment = sub.get("commitmentTerm", {})
-            commitment_str = commitment.get("term", "") if isinstance(commitment, dict) else ""
+            commitment = sub.get("commitmentTerm")
+            if isinstance(commitment, dict) and commitment:
+                commitment_term = commitment.get("term", "")
+                commitment_end = format_date(commitment.get("endDate"))
+                commitment_str = f"{commitment_term} (ends {commitment_end})" if commitment_end else commitment_term
+            else:
+                commitment_str = ""
             price = sub.get("price", "")
 
             summary_rows.append([
