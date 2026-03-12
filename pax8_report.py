@@ -372,7 +372,10 @@ def main():
                 commit_term, commit_end, partner_cost, price,
             ])
 
-            # Fetch subscription history
+            # Only fetch history for active/pending subscriptions (cancelled ones are noise)
+            if status == "Cancelled":
+                continue
+
             print(f"  Fetching history for subscription {sub_idx}/{len(ms_subs)}...", flush=True)
             try:
                 history = fetch_subscription_history(session, sub_id)
