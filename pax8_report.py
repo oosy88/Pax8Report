@@ -5,6 +5,7 @@ Generates an Excel report of all Microsoft subscriptions across all clients,
 including full subscription history.
 """
 
+import json
 import os
 import sys
 import time
@@ -26,6 +27,7 @@ TOKEN_URL = "https://token-manager.pax8.com/oauth/token"
 PAGE_SIZE = 200  # max allowed by PAX8 API
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1  # seconds
+DIAGNOSTIC = True  # set to False to disable raw API dumps
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +251,17 @@ def format_date(value):
         return str(value)
 
 
+def best_history_date(record):
+    """Pick the best date field from a history record for the effective date.
+    Try multiple fields in priority order since the API schema isn't clear
+    on which field represents the 'effective date' shown in the web UI."""
+    for field in ("billingStart", "startDate", "createdDate", "updatedDate"):
+        val = record.get(field)
+        if val:
+            return format_date(val)
+    return ""
+
+
 def generate_report(summary_rows, history_rows):
     """Generate the Excel report and return the file path."""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -262,8 +275,8 @@ def generate_report(summary_rows, history_rows):
     ws_summary.title = "Summary"
     summary_headers = [
         "Company Name", "Subscription ID", "Product ID", "Product Name", "SKU",
-        "Status", "Current Quantity", "Start Date", "Billing Term",
-        "Commitment Term", "Price Per Unit",
+        "Status", "Current Quantity", "Start Date", "Commitment Type",
+        "Partner Cost", "Price",
     ]
     ws_summary.append(summary_headers)
 
@@ -318,6 +331,7 @@ def main():
     errors = []
     total_subscriptions = 0
     total_history_records = 0
+    diagnostic_done = False
 
     for idx, company in enumerate(companies, 1):
         company_name = company.get("name", "Unknown")
@@ -345,15 +359,6 @@ def main():
 
         total_subscriptions += len(ms_subs)
 
-        # Diagnostic: dump the first subscription's billing fields for debugging
-        if ms_subs and idx == 1:
-            sample_sub = ms_subs[0][0]
-            print("\n  --- DIAGNOSTIC: Raw subscription fields (first sub, first client) ---")
-            for field in ("billingTerm", "commitmentTerm", "price", "partnerCost",
-                          "billingStart", "startDate", "endDate", "status", "quantity"):
-                print(f"    {field}: {sample_sub.get(field)!r}")
-            print("  --- END DIAGNOSTIC ---\n")
-
         for sub_idx, (sub, product) in enumerate(ms_subs, 1):
             sub_id = sub.get("id", "")
             product_id = sub.get("productId", "")
@@ -362,20 +367,15 @@ def main():
             status = sub.get("status", "")
             quantity = sub.get("quantity", 0)
             start_date = format_date(sub.get("startDate"))
-            billing_term = sub.get("billingTerm", "")
-            commitment = sub.get("commitmentTerm")
-            if isinstance(commitment, dict) and commitment:
-                commitment_term = commitment.get("term", "")
-                commitment_end = format_date(commitment.get("endDate"))
-                commitment_str = f"{commitment_term} (ends {commitment_end})" if commitment_end else commitment_term
-            else:
-                commitment_str = ""
+            # billingTerm = commitment type (Annual, Monthly, etc.)
+            commitment_type = sub.get("billingTerm", "")
+            partner_cost = sub.get("partnerCost", "")
             price = sub.get("price", "")
 
             summary_rows.append([
                 company_name, sub_id, product_id, product_name, sku,
-                status, quantity, start_date, billing_term,
-                commitment_str, price,
+                status, quantity, start_date, commitment_type,
+                partner_cost, price,
             ])
 
             # Fetch subscription history
@@ -389,21 +389,44 @@ def main():
                 history = []
 
             if isinstance(history, list):
+                # Diagnostic: dump the first history record to see all available fields
+                if DIAGNOSTIC and not diagnostic_done and history:
+                    print("\n  --- DIAGNOSTIC: First raw history record ---")
+                    print(json.dumps(history[0], indent=2, default=str))
+                    if len(history) > 1:
+                        print("\n  --- DIAGNOSTIC: Second raw history record ---")
+                        print(json.dumps(history[1], indent=2, default=str))
+                    print("  --- END DIAGNOSTIC ---\n")
+                    diagnostic_done = True
+
                 prev_quantity = None
-                # Sort history by date ascending for change calculation
-                sorted_history = sorted(history, key=lambda h: h.get("createdDate", "") or "")
+                # Sort history by best available date ascending
+                sorted_history = sorted(
+                    history,
+                    key=lambda h: best_history_date(h) or ""
+                )
 
                 for record in sorted_history:
-                    record_date = format_date(record.get("createdDate"))
+                    record_date = best_history_date(record)
                     record_qty = record.get("quantity", 0)
+                    if record_qty is None:
+                        record_qty = 0
                     record_status = record.get("status", "")
 
                     if prev_quantity is not None:
                         qty_change = record_qty - prev_quantity
+                    else:
+                        qty_change = record_qty
+
+                    # Skip noise: Status/Config changes with no quantity change
+                    if prev_quantity is not None and qty_change == 0:
+                        prev_quantity = record_qty
+                        continue
+
+                    if prev_quantity is not None:
                         change_str = f"+{qty_change}" if qty_change > 0 else str(qty_change)
                     else:
                         change_str = "Initial"
-                        qty_change = record_qty
 
                     # Determine action type
                     if prev_quantity is None:
