@@ -5,7 +5,6 @@ Generates an Excel report of all Microsoft subscriptions across all clients,
 including full subscription history.
 """
 
-import json
 import os
 import sys
 import time
@@ -27,7 +26,6 @@ TOKEN_URL = "https://token-manager.pax8.com/oauth/token"
 PAGE_SIZE = 200  # max allowed by PAX8 API
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1  # seconds
-DIAGNOSTIC = True  # set to False to disable raw API dumps
 
 
 # ---------------------------------------------------------------------------
@@ -251,17 +249,6 @@ def format_date(value):
         return str(value)
 
 
-def best_history_date(record):
-    """Pick the best date field from a history record for the effective date.
-    Try multiple fields in priority order since the API schema isn't clear
-    on which field represents the 'effective date' shown in the web UI."""
-    for field in ("billingStart", "startDate", "createdDate", "updatedDate"):
-        val = record.get(field)
-        if val:
-            return format_date(val)
-    return ""
-
-
 def generate_report(summary_rows, history_rows):
     """Generate the Excel report and return the file path."""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -275,8 +262,8 @@ def generate_report(summary_rows, history_rows):
     ws_summary.title = "Summary"
     summary_headers = [
         "Company Name", "Subscription ID", "Product ID", "Product Name", "SKU",
-        "Status", "Current Quantity", "Start Date", "Commitment Type",
-        "Partner Cost", "Price",
+        "Status", "Current Quantity", "Start Date", "Billing Term",
+        "Commitment Term", "Commitment End", "Partner Cost", "Price",
     ]
     ws_summary.append(summary_headers)
 
@@ -331,7 +318,6 @@ def main():
     errors = []
     total_subscriptions = 0
     total_history_records = 0
-    diagnostic_done = False
 
     for idx, company in enumerate(companies, 1):
         company_name = company.get("name", "Unknown")
@@ -367,15 +353,23 @@ def main():
             status = sub.get("status", "")
             quantity = sub.get("quantity", 0)
             start_date = format_date(sub.get("startDate"))
-            # billingTerm = commitment type (Annual, Monthly, etc.)
-            commitment_type = sub.get("billingTerm", "")
+            billing_term = sub.get("billingTerm", "")
             partner_cost = sub.get("partnerCost", "")
             price = sub.get("price", "")
 
+            # commitment is a nested object with term and endDate
+            commitment = sub.get("commitment")
+            if isinstance(commitment, dict) and commitment:
+                commit_term = commitment.get("term", "")
+                commit_end = format_date(commitment.get("endDate"))
+            else:
+                commit_term = ""
+                commit_end = ""
+
             summary_rows.append([
                 company_name, sub_id, product_id, product_name, sku,
-                status, quantity, start_date, commitment_type,
-                partner_cost, price,
+                status, quantity, start_date, billing_term,
+                commit_term, commit_end, partner_cost, price,
             ])
 
             # Fetch subscription history
@@ -389,28 +383,19 @@ def main():
                 history = []
 
             if isinstance(history, list):
-                # Diagnostic: dump the first history record to see all available fields
-                if DIAGNOSTIC and not diagnostic_done and history:
-                    print("\n  --- DIAGNOSTIC: First raw history record ---")
-                    print(json.dumps(history[0], indent=2, default=str))
-                    if len(history) > 1:
-                        print("\n  --- DIAGNOSTIC: Second raw history record ---")
-                        print(json.dumps(history[1], indent=2, default=str))
-                    print("  --- END DIAGNOSTIC ---\n")
-                    diagnostic_done = True
-
                 prev_quantity = None
-                # Sort history by best available date ascending
+                # Sort history by billingStart (effective date) ascending
                 sorted_history = sorted(
                     history,
-                    key=lambda h: best_history_date(h) or ""
+                    key=lambda h: h.get("billingStart") or h.get("startDate") or ""
                 )
 
                 for record in sorted_history:
-                    record_date = best_history_date(record)
-                    record_qty = record.get("quantity", 0)
-                    if record_qty is None:
-                        record_qty = 0
+                    # Use billingStart as the effective date (matches web UI)
+                    record_date = format_date(
+                        record.get("billingStart") or record.get("startDate")
+                    )
+                    record_qty = record.get("quantity") or 0
                     record_status = record.get("status", "")
 
                     if prev_quantity is not None:
@@ -418,7 +403,7 @@ def main():
                     else:
                         qty_change = record_qty
 
-                    # Skip noise: Status/Config changes with no quantity change
+                    # Skip noise: rows where quantity didn't change
                     if prev_quantity is not None and qty_change == 0:
                         prev_quantity = record_qty
                         continue
