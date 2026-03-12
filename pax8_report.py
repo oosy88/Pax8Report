@@ -345,6 +345,15 @@ def main():
 
         total_subscriptions += len(ms_subs)
 
+        # Diagnostic: dump the first subscription's billing fields for debugging
+        if ms_subs and idx == 1:
+            sample_sub = ms_subs[0][0]
+            print("\n  --- DIAGNOSTIC: Raw subscription fields (first sub, first client) ---")
+            for field in ("billingTerm", "commitmentTerm", "price", "partnerCost",
+                          "billingStart", "startDate", "endDate", "status", "quantity"):
+                print(f"    {field}: {sample_sub.get(field)!r}")
+            print("  --- END DIAGNOSTIC ---\n")
+
         for sub_idx, (sub, product) in enumerate(ms_subs, 1):
             sub_id = sub.get("id", "")
             product_id = sub.get("productId", "")
